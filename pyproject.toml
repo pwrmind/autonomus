@@ -1,0 +1,11 @@
+[project]
+name = "autonomus"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "agent-framework>=1.19.0",
+    "agent-framework-ollama>=1.0.0b261008",
+    "pydantic>=2.14.2",
+]
