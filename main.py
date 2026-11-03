@@ -11,14 +11,9 @@ PLANNER_MODEL = "deepseek-r1:8b"
 EXECUTOR_MODEL = "lfm3:latest"
 MAX_STEPS = 5
 
-# Диагностика: печатать каждый чанк (лучше выключить, чтобы не мешало)
 DEBUG_STREAM = False
-
-# Буферизация: сбрасывать в консоль, когда накоплено столько символов
 REASONING_FLUSH_SIZE = 120
 ANSWER_FLUSH_SIZE = 60
-
-# Если True — рассуждения не печатаются, только индикатор «думает…»
 QUIET_REASONING = False
 
 # ========== ИНСТРУМЕНТЫ ==========
@@ -52,18 +47,26 @@ def save_to_file(
 # ========== ПРОМПТЫ ==========
 PLANNER_SYSTEM_PROMPT = (
     "Ты — Главный Архитектор и Планировщик (Team Lead). Управляй исполнителем для достижения цели.\n\n"
-    "ПРАВИЛА:\n"
+    "ПРАВИЛА ПЛАНИРОВАНИЯ:\n"
     "1. Анализируй историю: что сделано, что осталось.\n"
     "2. Формируй строго ОДИН следующий шаг.\n"
     "3. Если результат исполнителя плох — переформируй задачу или потребуй переделать.\n"
     "4. Когда цель достигнута — status=done.\n\n"
-    "ФОРМАТ (ЖЁСТКО Key-Value, каждая пара на новой строке):\n"
-    "task_name=техническое_название_шага\n"
-    "payload=инструкция для исполнителя (переносы строк — через \\n)\n"
-    "status=continue или status=done\n\n"
+    "ФОРМАТ ОТВЕТА (ЖЁСТКО, без отклонений):\n"
+    "Ответ — ТОЛЬКО три строки. Разделитель между ключом и значением — знак РАВНО '='.\n"
+    "После 'task_name', 'payload' и 'status' ВСЕГДА ставь '=' (не двоеточие!).\n\n"
+    "ПРИМЕР ПРАВИЛЬНОГО ОТВЕТА:\n"
+    "task_name=write_structure\n"
+    "payload=Создай HTML-шаблон с разделами:\\n1. Заголовок\\n2. Описание услуг\\n3. Контакты\n"
+    "status=continue\n\n"
+    "ТРЕБОВАНИЯ К ПОЛЯМ:\n"
+    "- task_name: короткое имя латиницей, без пробелов (например: write_structure).\n"
+    "- payload: инструкция для исполнителя. Значение payload — ОДНА строка. "
+    "Реальные переносы строк внутри payload запрещены — используй \\n (обратный слэш + n). "
+    "ВНУТРИ значения payload не используй '=' — заменяй на ':' или слова.\n"
+    "- status: ровно одно слово — continue или done, без пояснений.\n\n"
     "Если нужна документация или технические характеристики — в payload потребуй "
-    "использовать инструмент read_knowledge_base с нужной темой.\n"
-    "Не используй символ '=' внутри payload — заменяй на ':'."
+    "использовать инструмент read_knowledge_base с нужной темой."
 )
 
 EXECUTOR_SYSTEM_PROMPT = (
@@ -108,28 +111,51 @@ def ensure_knowledge_base():
             print(f"📚 Создана база знаний: {filename}")
 
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ==========
-def parse_key_value(text: str) -> dict:
-    parsed = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if "=" in line:
-            key, val = line.split("=", 1)
-            parsed[key.strip()] = val.strip()
-    return parsed
+# ========== РОБАСТНЫЙ ПАРСЕР ==========
+def parse_planner_output(text: str) -> dict:
+    """
+    Устойчивый парсер Key-Value вывода планировщика.
+    Принимает и '=', и ':' как разделитель ключа и значения.
+    Собирает многострочный payload до ближайшего 'status[:=]' или конца текста.
+    Разэкранирует '\\n', если модель использовала escape-последовательности.
+    """
+    # Убираем возможные остатки <think>...</think>
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    result: dict = {}
 
+    # task_name: значение до конца строки
+    m = re.search(
+        r"^[ \t]*task_name[ \t]*[:=][ \t]*(.+?)[ \t]*$",
+        text, re.MULTILINE | re.IGNORECASE,
+    )
+    if m:
+        result["task_name"] = m.group(1).strip()
 
-def _iter_contents(update):
-    contents = getattr(update, "contents", None)
-    if contents is None:
-        return []
-    return contents if isinstance(contents, (list, tuple)) else [contents]
+    # status: значение до конца строки
+    m = re.search(
+        r"^[ \t]*status[ \t]*[:=][ \t]*(.+?)[ \t]*$",
+        text, re.MULTILINE | re.IGNORECASE,
+    )
+    if m:
+        result["status"] = m.group(1).strip().lower()
+
+    # payload: всё от 'payload[:=]' до ближайшего '^status[:=]' или конца текста
+    m = re.search(
+        r"^[ \t]*payload[ \t]*[:=][ \t]*(.*?)(?=^[ \t]*status[ \t]*[:=]|\Z)",
+        text, re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
+    if m:
+        payload = m.group(1).strip()
+        # Если модель экранировала переносы как \n, а реальных переносов нет — разэкранируем
+        if "\\n" in payload and "\n" not in payload:
+            payload = payload.replace("\\n", "\n")
+        result["payload"] = payload
+
+    return result
 
 
 # ========== БУФЕРИЗОВАННЫЙ СТРИМИНГ ==========
 class StreamBuffer:
-    """Накапливает текст и сбрасывает его в консоль крупными блоками."""
-
     def __init__(self, label: str, flush_size: int, quiet: bool = False):
         self.label = label
         self.flush_size = flush_size
@@ -161,7 +187,14 @@ class StreamBuffer:
     def finish(self):
         self.flush()
         if not self.quiet and self._printed_header:
-            print()  # перевод строки после блока
+            print()
+
+
+def _iter_contents(update):
+    contents = getattr(update, "contents", None)
+    if contents is None:
+        return []
+    return contents if isinstance(contents, (list, tuple)) else [contents]
 
 
 async def run_planner_streaming(agent: Agent, context: str) -> tuple[str, str]:
@@ -184,11 +217,8 @@ async def run_planner_streaming(agent: Agent, context: str) -> tuple[str, str]:
             if ctype == "text_reasoning" and ctext:
                 reasoning_parts.append(ctext)
                 reasoning_buf.add(ctext)
-                if QUIET_REASONING:
-                    # Показываем только редкие точки, чтобы было видно, что процесс идёт
-                    if reasoning_buf.total_chars % 200 < len(ctext):
-                        print(".", end="", flush=True)
-
+                if QUIET_REASONING and reasoning_buf.total_chars % 200 < len(ctext):
+                    print(".", end="", flush=True)
             elif ctype == "text" and ctext:
                 answer_parts.append(ctext)
                 answer_buf.add(ctext)
@@ -225,10 +255,8 @@ async def run_executor_streaming(agent: Agent, payload: str) -> str:
                 answer_buf.add(ctext)
 
     answer_buf.finish()
-
     if not got_any:
         print("⚠️ Стрим исполнителя не вернул ни одного чанка.")
-
     return "".join(result_parts)
 
 
@@ -245,7 +273,6 @@ async def main():
         instructions=PLANNER_SYSTEM_PROMPT,
         default_options={"think": True},
     )
-
     executor_agent = Agent(
         client=executor_client,
         name="ExecutorAgent",
@@ -253,7 +280,7 @@ async def main():
         tools=[read_knowledge_base, save_to_file],
     )
 
-    print("🤖 Автономный мультиагент с буферизованным стримингом готов.")
+    print("🤖 Автономный мультиагент готов.")
     global_goal = input("🎯 Введите глобальную задачу: ").strip()
     if not global_goal:
         print("❌ Пустая задача. Выход.")
@@ -266,17 +293,16 @@ async def main():
         print(f"\n{'=' * 60}\nШАГ {step} / {MAX_STEPS}")
 
         _, raw_answer = await run_planner_streaming(planner_agent, current_context)
-
-        clean_answer = re.sub(r"<think>.*?</think>", "", raw_answer, flags=re.DOTALL).strip()
-        task_data = parse_key_value(clean_answer)
+        task_data = parse_planner_output(raw_answer)
 
         task_name = task_data.get("task_name", "UnknownTask")
-        payload = task_data.get("payload", "").replace("\\n", "\n")
+        payload = task_data.get("payload", "").strip()
         status = task_data.get("status", "continue")
 
         if not payload:
             print("⚠️ Планировщик вернул пустой payload или нарушил формат.")
-            print("Сырой ответ:", clean_answer[:500])
+            print("Сырой ответ (первые 800 символов):")
+            print(raw_answer[:800])
             break
 
         print(f"\n📋 Задача: {task_name}")
@@ -288,7 +314,6 @@ async def main():
             break
 
         execution_output = await run_executor_streaming(executor_agent, payload)
-
         print("-" * 60)
 
         current_context += (
